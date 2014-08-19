@@ -1,0 +1,222 @@
+#!/bin/bash
+
+#set -e
+
+CPUS="8"
+SHORTEST="31"
+EXE=$(basename $0)
+FORCE=0
+CLIP=1
+
+#............................................................................
+
+function banner {
+  HBAR="~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  echo -e "$HBAR\n$*\n$HBAR" 1>&2
+}
+
+function msg {
+  echo -e "$*" 1>&2
+}
+
+function err {
+  echo "ERROR: $*" 1>&2
+  exit 1
+}
+
+function exitOnFailure {
+  if [ $1 -ne 0 ]; then
+    err "$2 failed to run (errorcode=$1)"
+  fi
+}
+
+function usage {
+  msg "Name:\n  $EXE - automatic de novo assembly of Illumina paired end reads"
+  msg "Author:\n  Torsten Seemann <torsten.seemann@monash.edu>"
+  msg "Usage:\n  $EXE [options] <outdir> <R1.fq.gz> <R2.fq.gz>"
+  msg "Parameters:"
+  msg "  <outdir>    folder to put results in"
+  msg "  <R1.fq.gz>  FASTQ with read 1, optionally .gz compressed"
+  msg "  <R2.fq.gz>  FASTQ with read 2, optionally .gz compressed"
+  msg "Options:"
+  msg "  -h          Show this help"
+  msg "  -t N        Allow up to N parallel threads to be used (default=$CPUS)"
+  msg "  -f          Allow overwriting of existing <outdir>"
+  msg "  -n          Don't trim/clip the reads"
+  msg "  -r FASTA    Order and orient contigs to this reference"
+  exit 1 
+}
+
+#...........................................................................
+
+while getopts 'hfnr:t:' opt ; do
+  case $opt in
+    h)
+      usage
+      ;;
+    f)
+      FORCE=1
+      ;;
+    n) 
+      CLIP=0
+      ;;
+    r)
+      REF=$OPTARG
+      [ ! -r "$REF" ] && err "Can not read -r FASTA file: $REF"
+      ;;
+    t)
+      CPUS=$OPTARG
+      [[ $CPUS =~ ^[1-9][0-9]*$ ]] || err "-t must be an integer > 0, not '$CPUS'"
+      ;;
+
+  esac
+done
+
+# skip over out options
+shift $((OPTIND-1))
+
+# read our mandatory positional parameters
+
+if [ $# -lt 3 ]; then
+  usage
+fi
+
+OUTDIR="$(readlink -f "$1")"
+R1="$(readlink -e "$2")" 
+R2="$(readlink -e "$3")"
+
+banner "Checking command line parameters"
+
+[ -d "$OUTDIR" -a "$FORCE" -eq "0" ] && err "Output folder already exists: $OUTDIR"
+[ ! -r "$R1" ] && err "Can not access R1 read file: $R1"
+[ ! -r "$R2" ] && err "Can not access R2 read file: $R2"
+
+msg "Output folder: $OUTDIR"
+msg "Read 1 file: $R1"
+msg "Read 2 file: $R2"
+msg "Will use $CPUS CPU threads"
+msg "Clip reads: $CLIP"
+msg "Force overwrite: $FORCE"
+msg "Reference genome: $REF"
+
+#............................................................................
+
+banner "Checking external dependencies"
+
+for EXE in spades.py kmergenie nesoni fa-tile_contigs.pl perl gzip readlink grep sort head tail ; do
+  WHERE=$(which $EXE)
+  if [ "$WHERE" != "" ]; then
+    msg "Checking for $EXE - found $WHERE"
+  else
+    err "Could not find the required '$EXE' command"
+  fi
+done
+
+#............................................................................
+
+banner "Output folder"
+msg "Using: $OUTDIR"
+mkdir -v -p "$OUTDIR"
+exitOnFailure $? "mkdir"
+
+banner "Trimming reads"
+if [ $CLIP != 0 ]; then
+  CLIP1="$OUTDIR/clipped_R1.fq.gz"
+  CLIP2="$OUTDIR/clipped_R2.fq.gz"
+  nesoni clip: --quality 10 --out-separate yes --length $SHORTEST \
+  	"$OUTDIR/clipped" \
+  	pairs: "$R1" "$R2"
+  exitOnFailure $? "nesoni"
+else
+  msg "User specified -n so skipping read trimming."
+  # we use readlink to ensure a canonical filename 
+  # and so we don't delete the original reads later accidently!
+  CLIP1="$OUTDIR/$(basename "$R1")"
+  CLIP2="$OUTDIR/$(basename "$R2")"
+  ln -vs "$R1" "$CLIP1" 
+  ln -vs "$R2" "$CLIP2"
+fi
+
+[ -r "$CLIP1" ] || err "No clipped R1 was created?"
+[ -r "$CLIP2" ] || err "No clipped R2 was created?"
+
+FOF="$OUTDIR/read_files.txt"
+banner "Creating file of read files: $FOF";
+echo "$CLIP1" >  "$FOF"
+echo "$CLIP2" >> "$FOF"
+cat $FOF 1>&2
+
+banner "Estimating read length distribution"
+READLENS="$OUTDIR/read_lengths.csv"
+gzip -d -c -f "$CLIP1" "$CLIP2" \
+	| head -n 100000 \
+	| perl -ne '$L{length($_)-1}++ if ($.-1)%4==1; END { for (sort {$b<=>$a} keys %L) { print "$_\t$L{$_}\n"; } }' \
+	| tee "$READLENS" \
+	| head -n 5
+LONGEST=$(head -n 1 "$READLENS" | cut -f 1)
+echo "Longest read: $LONGEST"
+[ $LONGEST -lt $SHORTEST ] && err "Sequence reads are too short. You have $LONGEST bp, need >= $SHORTEST bp"
+
+banner "Running kmergenie"
+if [ $LONGEST -gt 127 ]; then
+  LONGEST=127
+  msg "Will test k-mer range: $SHORTEST .. $LONGEST"
+fi
+kmergenie -o "$OUTDIR/histograms" -l $SHORTEST -k $LONGEST -t $CPUS "$FOF" \
+	2>&1 | tee "$OUTDIR/kmergenie_log.txt"
+exitOnFailure $? "kmergenie"
+
+banner "Cleaning up kmergenie output"
+rm -fv "$OUTDIR"/*.{histo,pdf,html}
+
+banner "Extracting optimal assembly parameters"
+ROW=$(sort -k2nr "$OUTDIR/histograms.dat" | head -n 1)
+# don't put quotes around $ROW and it will turn into a space-sep list/array
+COL=( $ROW )
+BESTK=${COL[0]}
+ESTSIZE=${COL[1]}
+CUTOFF=${COL[2]}
+msg "Optimal K value: $BESTK"
+msg "Estimated genome size: $ESTSIZE"
+msg "Optimal coverage cutoff: $CUTOFF"
+
+banner "Assembling with Spades"
+spades.py \
+	-o "$OUTDIR" --only-assembler --careful \
+	--threads "$CPUS" --memory 16 \
+	-k $BESTK \
+	-1 "$CLIP1" -2 "$CLIP2"
+exitOnFailure $? "spades"
+
+banner "Cleaning up folder: $OUTDIR"
+mv -v "$OUTDIR/scaffolds.fasta" "$OUTDIR/contigs.fa"
+mv -v "$OUTDIR/spades.log" "$OUTDIR/spades_log.txt"
+mv -v "$OUTDIR/histograms.dat" "$OUTDIR/kmergenie_stats.csv"
+rm -fv "$CLIP1" "$CLIP2" 
+rm -fv "$OUTDIR"/*.{fasta,fastg,info,yaml,gz,info}
+rm -fvr "$OUTDIR"/{tmp,misc,K??,K???,params.txt}
+
+banner "Measuring assembly stats"
+CONTIGS=$(grep -c '>' "$OUTDIR/contigs.fa")
+CORRS=$(grep '^TOTAL' "$OUTDIR/spades_log.txt" | tail -n 1 | sed 's/^TOTAL...//')
+COVERAGE=$(grep 'Average coverage' "$OUTDIR/spades_log.txt" | sed 's/^.* = //')
+BASES=$(grep -v '>' "$OUTDIR/contigs.fa" | wc -c);
+LINES=$(grep -v '>' "$OUTDIR/contigs.fa" | wc -l);
+BASES=$((BASES - LINES))
+msg "Contigs: $CONTIGS"
+msg "Coverage: $COVERAGE"
+msg "Basepairs: $BASES"
+msg "Corrections: $CORRS"
+
+banner "Tiling contigs to reference"
+if [ -n "$REF" ]; then
+  fa-tile_contigs.pl -r "$REF" -c "$OUTDIR/contigs.fa" -o "$OUTDIR/tiled.fa"
+  exitOnFailure $? "fa-tile_contigs.pl"
+  mv -vf "$OUTDIR/tiled.fa" "$OUTDIR/contigs.fa"
+else
+  msg "No tiling performed. Please use the -r option to enable this."
+fi
+
+banner "Finished"
+msg "Result in $OUTDIR/contigs.fa"
+
